@@ -12,7 +12,6 @@ from seq2seq.data.dictionary import Dictionary
 from seq2seq.data.dataset import Seq2SeqDataset, BatchSampler
 from seq2seq.beam import BeamSearch, BeamSearchNode
 
-
 def get_args():
     """ Defines generation-specific hyper-parameters. """
     parser = argparse.ArgumentParser('Sequence to Sequence Model')
@@ -29,9 +28,11 @@ def get_args():
 
     # Add beam search arguments
     parser.add_argument('--beam-size', default=5, type=int, help='number of hypotheses expanded in beam search')
-
+    # Add length normalization arguments
+    parser.add_argument('--alpha', default=1.0, type=float, help='length normalization')
+    parser.add_argument('--gamma', default=1.0, type=float, help='diversity')
+    parser.add_argument('--n', default=1, type=int, help='nnumber of hypotheses')
     return parser.parse_args()
-
 
 def main(args):
     """ Main translation function' """
@@ -114,7 +115,11 @@ def main(args):
                 # __QUESTION 3: What happens internally when we add a new beam search node?
                 node = BeamSearchNode(searches[i], emb, lstm_out, final_hidden, final_cell,
                                       mask, torch.cat((go_slice[i], next_word)), log_p, 1)
-                searches[i].add(-node.eval(), node)
+                # Add length normalization
+                score = node.logp / normalizer(node.length)
+                # Add diversity
+                score = diversity(score, j)
+                searches[i].add(-score, node)
 
         # Start generating further tokens until max sentence length reached
         for _ in range(args.max_len-1):
@@ -168,14 +173,22 @@ def main(args):
                         node = BeamSearchNode(search, node.emb, node.lstm_out, node.final_hidden,
                                               node.final_cell, node.mask, torch.cat((prev_words[i][0].view([1]),
                                               next_word)), node.logp, node.length)
-                        search.add_final(-node.eval(), node)
+                        # Add length normalization
+                        score = node.logp / normalizer(node.length)
+                        # Add diversity
+                        score = diversity(score, j)
+                        search.add_final(-score, node)
 
                     # Add the node to current nodes for next iteration
                     else:
                         node = BeamSearchNode(search, node.emb, node.lstm_out, node.final_hidden,
                                               node.final_cell, node.mask, torch.cat((prev_words[i][0].view([1]),
                                               next_word)), node.logp + log_p, node.length + 1)
-                        search.add(-node.eval(), node)
+                        # Add length normalization
+                        score = node.logp / normalizer(node.length)
+                        # Add diversity
+                        score = diversity(score, j)
+                        search.add(-score, node)
 
             # __QUESTION 5: What happens internally when we prune our beams?
             # How do we know we always maintain the best sequences?
@@ -183,34 +196,71 @@ def main(args):
                 search.prune()
 
         # Segment into sentences
-        best_sents = torch.stack([search.get_best()[1].sequence[1:] for search in searches])
-        decoded_batch = best_sents.numpy()
+        if args.n is not None:
+            load_n_best(searches, all_hyps, tgt_dict, sample)
+        else:
+            best_sents = torch.stack([search.get_best()[1].sequence[1:] for search in searches])
+            decoded_batch = best_sents.numpy()
+            print(best_sents)
+            output_sentences = [decoded_batch[row, :] for row in range(decoded_batch.shape[0])]
 
-        output_sentences = [decoded_batch[row, :] for row in range(decoded_batch.shape[0])]
+            # __QUESTION 6: What is the purpose of this for loop?
+            temp = list()
+            for sent in output_sentences:
+                first_eos = np.where(sent == tgt_dict.eos_idx)[0]
+                if len(first_eos) > 0:
+                    temp.append(sent[:first_eos[0]])
+                else:
+                    temp.append(sent)
+            output_sentences = temp
 
-        # __QUESTION 6: What is the purpose of this for loop?
-        temp = list()
-        for sent in output_sentences:
-            first_eos = np.where(sent == tgt_dict.eos_idx)[0]
-            if len(first_eos) > 0:
-                temp.append(sent[:first_eos[0]])
-            else:
-                temp.append(sent)
-        output_sentences = temp
+            # Convert arrays of indices into strings of words
+            output_sentences = [tgt_dict.string(sent) for sent in output_sentences]
 
-        # Convert arrays of indices into strings of words
-        output_sentences = [tgt_dict.string(sent) for sent in output_sentences]
+            for ii, sent in enumerate(output_sentences):
+                all_hyps[int(sample['id'].data[ii])] = sent
+    # Write to file
+    write_to_file(all_hyps)
 
-        for ii, sent in enumerate(output_sentences):
-            all_hyps[int(sample['id'].data[ii])] = sent
-
-
+def write_to_file(all_hyps):
     # Write to file
     if args.output is not None:
         with open(args.output, 'w') as out_file:
-            for sent_id in range(len(all_hyps.keys())):
-                out_file.write(all_hyps[sent_id] + '\n')
+            if args.n is None:
+                for sent_id in range(len(all_hyps.keys())):
+                    out_file.write(all_hyps[sent_id] + '\n')
+            else:
+                for sent_id in range(int(len(all_hyps) / args.beam_size)):
+                    for len_id in range(args.n):
+                        out_file.write(str((sent_id, len_id)) + " " + all_hyps[(sent_id, len_id)] + '\n')
 
+def normalizer(length):
+    return ((5 + length) / 6.0) ** args.alpha
+
+def diversity(score, k):
+    return score - args.gamma * k
+
+def load_n_best(searches, all_hyps, tgt_dict, sample):
+    for search in searches:
+        n_best = search.get_n_hypotheses()
+        sentences = []
+        for cnt, sentence in enumerate(n_best):
+            sentences = sentence[1].sequence[1:]
+            output_sentences = [sentences.numpy()]
+            temp = list()
+            for o_sentence in output_sentences:
+                eos = np.where(o_sentence == tgt_dict.eos_idx)
+                first_eos = eos[0]
+                if len(first_eos) > 0:
+                    temp.append(o_sentence[:first_eos[0]])
+                else:
+                    temp.append(o_sentence)
+            output_sentences = temp
+            # Convert arrays of indices into strings of words
+            output_sentences = [tgt_dict.string(sent) for sent in output_sentences]
+            # print('output_sentences', item, output_sentences)
+            for index, sent in enumerate(output_sentences):
+                all_hyps[(int(sample['id'].data[index]), cnt)] = sent
 
 if __name__ == '__main__':
     args = get_args()
